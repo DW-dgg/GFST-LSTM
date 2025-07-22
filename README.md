@@ -1,1 +1,1 @@
-# GFST-LSTM
+The structure of GFST-LSTM: A four-layer stacked ST-LSTM, within each layer, "global attention" and "Fast Fourier convolution" are combined into LSTM gating. Spatial memory is vertically cross-layer, and temporal memory is updated horizontally within each layer. Residual down/up sampling is added once at the top and once at the bottom.# GFST-LSTM
