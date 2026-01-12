@@ -5,7 +5,6 @@ import torch.nn.functional as F
 class FourierConv(nn.Module):
     """
     Fast Fourier Convolution (FFC) module
-    修改：更精确的频域滤波器初始化
     """
     def __init__(self, channels, h, w):
         super(FourierConv, self).__init__()
@@ -14,7 +13,6 @@ class FourierConv(nn.Module):
         self.local_channels = int(channels * 0.6)
         self.global_channels = channels - self.local_channels
         
-        # 本地分支：空域卷积
         self.local_conv = nn.Conv2d(
             self.local_channels, 
             self.local_channels, 
@@ -24,7 +22,6 @@ class FourierConv(nn.Module):
         )
         self.local_bn = nn.BatchNorm2d(self.local_channels)
         
-        # 频域滤波器 W_freq：扩展为 3D Tensor [C_global, H, W//2+1]
         self.h_fft = h
         self.w_fft = w // 2 + 1
         self.weight_real = nn.Parameter(torch.empty(self.global_channels, self.h_fft, self.w_fft))
@@ -33,55 +30,38 @@ class FourierConv(nn.Module):
         self.reset_parameters()
         
     def reset_parameters(self):
-        """
-        更精确的频域滤波器初始化：考虑FFT的对称性
-        低频分量位于四个角落（对于rfft2，主要在左侧边界）
-        """
         with torch.no_grad():
             for i in range(self.h_fft):
                 for j in range(self.w_fft):
-                    # 计算频率距离（考虑周期性边界条件）
-                    # 对于高度维度，频率从中心向两边递增
                     freq_h = min(i, self.h_fft - i)
-                    # 对于宽度维度（rfft2），频率从左边界递增
                     freq_w = j
                     
-                    # 归一化的频率距离
                     freq_dist = ((freq_h / (self.h_fft / 2))**2 + 
                                 (freq_w / self.w_fft)**2)**0.5
                     
-                    # 指数衰减初始化：低频权重大，高频权重小
-                    # 使用更陡峭的衰减以更强调低频
                     val = 1.5 * torch.exp(torch.tensor(-2.0 * freq_dist))
                     self.weight_real[:, i, j] = val
             
-            # 虚部初始化为 0
             self.weight_imag.fill_(0.0)
         
     def forward(self, x):
         B, C, H, W = x.size()
         assert C == self.channels, f"Input channels {C} does not match expected channels {self.channels}"
         
-        # 分割为本地和全局分支
         x_local = x[:, :self.local_channels, :, :]
         x_global = x[:, self.local_channels:, :, :]
         
-        # 本地分支：空域卷积
         out_local = self.local_conv(x_local)
         out_local = self.local_bn(out_local)
         out_local = F.relu(out_local)
-
-        # 全局分支：频域处理
+        
         x_fft = torch.fft.rfft2(x_global, norm="ortho")
         
-        # 应用可学习的频域滤波器 W_freq
         weight_complex = torch.complex(self.weight_real, self.weight_imag).to(x_fft.device)
         x_fft_weighted = x_fft * weight_complex
         
-        # 逆傅里叶变换回空域
         out_global = torch.fft.irfft2(x_fft_weighted, s=(H, W), norm="ortho")
 
-        # 合并本地和全局分支
         out = torch.cat([out_local, out_global], dim=1)
         
         return out
@@ -90,41 +70,33 @@ class FourierConv(nn.Module):
 class CBAM(nn.Module):
     """
     Convolutional Block Attention Module with 3D Permutation
-    新增：3D置换操作，将C×H×W转换为H×W×C
     """
     def __init__(self, channels, bottleneck_d=256):
         super(CBAM, self).__init__()
         
-        # 通道注意力子模块
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        # MLP 架构：输入 -> 瓶颈层(d=256) -> 输出
         self.mlp = nn.Sequential(
             nn.Conv2d(channels, bottleneck_d, 1, bias=False),
             nn.ReLU(),
             nn.Conv2d(bottleneck_d, channels, 1, bias=False)
         )
         
-        # 空间注意力子模块
         self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
-        # 3D置换操作：C×H×W -> H×W×C
         B, C, H, W = x.shape
         x_permuted = x.permute(0, 2, 3, 1)  # [B, H, W, C]
         
-        # 通过MLP处理（需要转回C×H×W格式）
         x = x_permuted.permute(0, 3, 1, 2)  # [B, C, H, W]
         
-        # 通道注意力 Mc
         avg_out = self.mlp(self.avg_pool(x))
         max_out = self.mlp(self.max_pool(x))
         channel_attention = self.sigmoid(avg_out + max_out)
         x = x * channel_attention
         
-        # 空间注意力 Ms
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial_attention = self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
@@ -134,10 +106,7 @@ class CBAM(nn.Module):
 
 
 class SpatioTemporalLSTMCell(nn.Module):
-    """
-    Spatio-Temporal LSTM Cell
-    保持原有实现不变
-    """
+    
     def __init__(self, in_channel, num_hidden, height, width, filter_size, stride):
         super(SpatioTemporalLSTMCell, self).__init__()
         self.num_hidden = num_hidden
@@ -197,13 +166,6 @@ class SpatioTemporalLSTMCell(nn.Module):
 
 
 class GFST_LSTM(nn.Module):
-    """
-    GFST-LSTM 网络主体结构
-    修改：
-    1. 使用卷积和转置卷积进行下采样/上采样
-    2. 输出层改为简单的1×1卷积
-    3. 集成3D置换操作
-    """
     def __init__(self, num_layers, num_hidden, configs):
         super(GFST_LSTM, self).__init__()
         
@@ -221,7 +183,6 @@ class GFST_LSTM(nn.Module):
         
         self.CBAM = CBAM(num_hidden[0], bottleneck_d=256)
         
-        # 修改1：使用卷积进行下采样（替代最大池化）
         self.downsample_layers = nn.ModuleList()
         n = configs.sampling_times
         for i in range(n):
@@ -236,7 +197,6 @@ class GFST_LSTM(nn.Module):
                 )
             )
         
-        # 修改1：使用转置卷积进行上采样（替代双线性插值）
         self.upsample_layers = nn.ModuleList()
         for i in range(n):
             self.upsample_layers.append(
@@ -250,7 +210,6 @@ class GFST_LSTM(nn.Module):
                 )
             )
         
-        # 修改2：输出层改为简单的1×1卷积（替代SRCNN）
         self.output_conv = nn.Conv2d(
             num_hidden[-1], 
             configs.patch_size * configs.patch_size * configs.img_channel,
@@ -259,7 +218,6 @@ class GFST_LSTM(nn.Module):
             padding=0
         )
         
-        # 计算特征图尺寸
         cell_list = []
         height = configs.img_width // configs.patch_size
         width = configs.img_width // configs.patch_size
@@ -278,7 +236,6 @@ class GFST_LSTM(nn.Module):
             )
         self.cell_list = nn.ModuleList(cell_list)
         
-        # FFC 模块
         self.ffc_modules = nn.ModuleList()
         if num_layers > 1:
             for i in range(1, num_layers):
@@ -320,10 +277,8 @@ class GFST_LSTM(nn.Module):
             frames_feature = net
             x_t = self.merge(frames_feature)
             
-            # 修改3：应用CBAM（包含3D置换操作）
             x_t = self.CBAM(x_t)
             
-            # 修改1：使用卷积下采样
             for downsample in self.downsample_layers:
                 x_t = F.relu(downsample(x_t))
             
@@ -337,14 +292,13 @@ class GFST_LSTM(nn.Module):
             
             out = h_t[self.num_layers - 1]
             
-            # 修改1：使用转置卷积上采样
             for upsample in self.upsample_layers:
                 out = F.relu(upsample(out))
             
-            # 修改2：使用1×1卷积输出
             x_gen = self.output_conv(out)
             next_frames.append(x_gen)
         
         next_frames = torch.stack(next_frames, dim=0).permute(1, 0, 2, 3, 4).contiguous()
         
         return next_frames
+
