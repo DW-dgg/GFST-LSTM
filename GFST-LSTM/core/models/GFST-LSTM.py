@@ -2,32 +2,53 @@ import math
 import torch
 import torch.nn as nn
 from core.layers.ST_LSTMCell import SpatioTemporalLSTMCell
+import torch
+from torch import nn
 
-class GAM_Attention(nn.Module):
-    def __init__(self, in_channels, rate=4):
-        super(GAM_Attention, self).__init__()
-        self.channel_attention = nn.Sequential(
-            nn.Linear(in_channels, int(in_channels / rate)),
-            nn.ReLU(inplace=True),  
-            nn.Linear(int(in_channels / rate), in_channels)
-        )
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(in_channels, int(in_channels / rate), kernel_size=7, padding=3),
-            nn.BatchNorm2d(int(in_channels / rate)),  
-            nn.ReLU(inplace=True),  
-            nn.Conv2d(int(in_channels / rate), in_channels, kernel_size=7, padding=3),
-            nn.BatchNorm2d(in_channels)  
-        )
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        b, c, h, w = x.shape  
-        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)
-        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)
-        x_channel_att = x_att_permute.permute(0, 3, 1, 2).sigmoid()
-        x = x * x_channel_att
-        x_spatial_att = self.spatial_attention(x).sigmoid()
-        out = x * x_spatial_att
-        return out
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        result = out * self.sa(out)
+        return result
 
 class FourierConv(nn.Module):
     def __init__(self, channels):
@@ -89,7 +110,7 @@ class RNN(nn.Module):
             nn.Conv2d(self.num_hidden[-1], self.frame_channel, kernel_size=1, stride=1, padding=0)
         )
         
-        self.GAM = GAM_Attention(in_channels=64)
+        self.CBAM = CBAM(in_channels=64)
         self.ffc_modules = nn.ModuleList()
         if num_layers > 1:
             for i in range(1, num_layers):
@@ -123,7 +144,7 @@ class RNN(nn.Module):
                 
             frames_feature = net
             x_t = self.merge(frames_feature)
-            x_t = self.GAM(x_t)
+            x_t = self.CBAM(x_t)
             
             for i in range(n):
                 x_t = self.Downsample(x_t)
